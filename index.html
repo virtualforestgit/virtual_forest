@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Virtual Forest</title>
+  <style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#0b0f0b; }
+    #hud{
+      position:fixed; left:12px; top:12px;
+      font: 13px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      color:#e7efe7; background:rgba(0,0,0,.35);
+      padding:10px 12px; border-radius:10px; backdrop-filter: blur(6px);
+      max-width: 360px;
+    }
+    #hud b { font-weight: 650; }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <b>Virtual Forest</b><br/>
+    Starts with 5 trees, +1 per day, grows for 30 days.<br/>
+    <span id="stats"></span>
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
+import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js?module";
+
+    // ---------- Utilities: deterministic "random" ----------
+    // Hash string -> 32-bit seed
+    function xmur3(str) {
+      let h = 1779033703 ^ str.length;
+      for (let i = 0; i < str.length; i++) {
+        h = Math.imul(h ^ str.charCodeAt(i), 3432918353);
+        h = (h << 13) | (h >>> 19);
+      }
+      return function() {
+        h = Math.imul(h ^ (h >>> 16), 2246822507);
+        h = Math.imul(h ^ (h >>> 13), 3266489909);
+        h ^= h >>> 16;
+        return h >>> 0;
+      };
+    }
+    // Seed -> PRNG [0,1)
+    function mulberry32(a) {
+      return function() {
+        let t = a += 0x6D2B79F5;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+    const clamp01 = (x) => Math.max(0, Math.min(1, x));
+    const lerp = (a,b,t) => a + (b-a)*t;
+
+    // ---------- Daily logic ----------
+    // Choose a fixed start date (local time). Change this whenever you want to "reset" the forest season.
+    const FOREST_START = new Date('2026-01-01T00:00:00'); // <-- change if you want
+    const now = new Date();
+    const daysSinceStart = Math.max(0, Math.floor((now - FOREST_START) / (1000*60*60*24)));
+    const treeCount = 5 + daysSinceStart;
+
+    // ---------- Three.js scene ----------
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x2f3b2f, 0.006);
+
+    const camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 0.1, 800);
+    camera.position.set(0, 18, 32);
+
+    const renderer = new THREE.WebGLRenderer({ antialias:true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 8, 0);
+    controls.maxPolarAngle = Math.PI * 0.49;
+
+    // Lights (semi-realistic)
+    scene.add(new THREE.HemisphereLight(0xcfe8ff, 0x3a5a3a, 1.2));
+    const sun = new THREE.DirectionalLight(0xfff3d6, 1.0);
+    sun.position.set(35, 55, 25);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.camera.left = -70;
+    sun.shadow.camera.right = 70;
+    sun.shadow.camera.top = 70;
+    sun.shadow.camera.bottom = -70;
+    sun.shadow.camera.near = 1;
+    sun.shadow.camera.far = 150;
+    scene.add(sun);
+
+    const fillLight = new THREE.DirectionalLight(0xffffff, 0.4);
+fillLight.position.set(-20, 30, -20);
+scene.add(fillLight);
+
+scene.add(new THREE.AmbientLight(0xffffff, 1.5));
+
+
+    // Ground
+    const groundGeo = new THREE.PlaneGeometry(220, 220, 1, 1);
+    const groundMat = new THREE.MeshStandardMaterial({
+      color: 0x1b2a1b,
+      roughness: 1.0,
+      metalness: 0.0
+    });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI/2;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    // Slight "mist" plane for depth
+    const mist = new THREE.Mesh(
+      new THREE.PlaneGeometry(240, 240),
+      new THREE.MeshBasicMaterial({ color: 0x0b0f0b, transparent:true, opacity:0.25 })
+    );
+    mist.rotation.x = -Math.PI/2;
+    mist.position.y = 0.02;
+    scene.add(mist);
+
+    // ---------- Tree factory (procedural, semi-realistic-ish) ----------
+    // We'll build each tree from:
+    // - tapered trunk (cylinder)
+    // - a few branches (cylinders)
+    // - leaf clusters (icosahedrons)
+    const trunkMat = new THREE.MeshStandardMaterial({ color: 0x5b3a22, roughness: 1.0, metalness: 0.0 });
+    const branchMat = new THREE.MeshStandardMaterial({ color: 0x4a2f1c, roughness: 1.0, metalness: 0.0 });
+    const leafMatA = new THREE.MeshStandardMaterial({ color: 0x1f6b3a, roughness: 0.9, metalness: 0.0 });
+    const leafMatB = new THREE.MeshStandardMaterial({ color: 0x2c7a44, roughness: 0.95, metalness: 0.0 });
+
+    function makeTree(seedStr, growth01) {
+      const seed = xmur3(seedStr)();
+      const rand = mulberry32(seed);
+
+      const g = new THREE.Group();
+
+      // Height and thickness depend on growth
+      const fullH = lerp(6.0, 12.5, rand());                 // adult height variety
+      const h = lerp(1.2, fullH, growth01);                   // current height
+      const baseR = lerp(0.25, 0.55, rand()) * lerp(0.6, 1.0, growth01);
+      const topR  = baseR * lerp(0.35, 0.6, rand());
+
+      const trunkGeo = new THREE.CylinderGeometry(topR, baseR, h, 10, 6);
+      const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+      trunk.castShadow = true;
+      trunk.position.y = h/2;
+      // slight lean
+      trunk.rotation.z = (rand()-0.5) * 0.08 * growth01;
+      trunk.rotation.x = (rand()-0.5) * 0.08 * growth01;
+      g.add(trunk);
+
+      // Branches appear gradually with growth
+      const branchCount = Math.floor(lerp(0, lerp(3, 8, rand()), growth01));
+      for (let i=0;i<branchCount;i++){
+        const t = (i+1)/(branchCount+1);
+        const attachY = lerp(h*0.35, h*0.95, t);
+        const brLenFull = lerp(2.0, 5.5, rand());
+        const brLen = brLenFull * lerp(0.3, 1.0, growth01);
+        const brR = baseR * lerp(0.18, 0.3, rand()) * lerp(0.6, 1.0, growth01);
+
+        const brGeo = new THREE.CylinderGeometry(brR*0.6, brR, brLen, 8, 1);
+        const br = new THREE.Mesh(brGeo, branchMat);
+        br.castShadow = true;
+
+        // point outward
+        const angle = rand() * Math.PI * 2;
+        const upTilt = lerp(0.35, 0.9, rand());
+        br.position.set(Math.cos(angle)*baseR*0.6, attachY, Math.sin(angle)*baseR*0.6);
+
+        // rotate branch so its length points outward/up
+        br.rotation.z = Math.PI/2 - upTilt;
+        br.rotation.y = angle;
+        // move so it starts near trunk
+        br.translateX(brLen/2);
+
+        g.add(br);
+
+        // Leaf cluster near branch end
+        const leafCount = Math.floor(lerp(0, lerp(3, 7, rand()), growth01));
+        for (let j=0;j<leafCount;j++){
+          const leafSize = lerp(0.45, 1.15, rand()) * lerp(0.4, 1.0, growth01);
+          const leafGeo = new THREE.IcosahedronGeometry(leafSize, 0);
+          const leaf = new THREE.Mesh(leafGeo, rand() < 0.5 ? leafMatA : leafMatB);
+          leaf.castShadow = true;
+
+          // place around branch tip
+          const spread = leafSize * 1.2;
+          const offset = new THREE.Vector3(
+            (rand()-0.5)*spread,
+            (rand()-0.2)*spread,
+            (rand()-0.5)*spread
+          );
+          // approximate branch end position by taking br's world direction
+          leaf.position.copy(br.position);
+          leaf.position.add(new THREE.Vector3(Math.cos(angle)*brLen, 0, Math.sin(angle)*brLen));
+          leaf.position.y += lerp(-0.2, 0.9, upTilt) * brLen * 0.35;
+          leaf.position.add(offset);
+
+          g.add(leaf);
+        }
+      }
+
+      // A simple canopy for younger trees so they don't look bare
+      const canopyStrength = clamp01((growth01 - 0.15) / 0.35);
+      if (canopyStrength > 0){
+        const canopySize = lerp(1.3, 3.8, rand()) * lerp(0.6, 1.0, canopyStrength);
+        const canopy = new THREE.Mesh(
+          new THREE.IcosahedronGeometry(canopySize, 1),
+          rand() < 0.5 ? leafMatA : leafMatB
+        );
+        canopy.castShadow = true;
+        canopy.position.y = h * lerp(0.65, 0.9, rand());
+        canopy.position.x = (rand()-0.5) * 0.6;
+        canopy.position.z = (rand()-0.5) * 0.6;
+        g.add(canopy);
+      }
+
+      return g;
+    }
+
+    // ---------- Place trees ----------
+    // Spread in a disk; keep deterministic positions derived from index
+    const forest = new THREE.Group();
+    scene.add(forest);
+
+    function placeTree(i) {
+      const ageDays = daysSinceStart - i;         // 0 for the newest tree today
+      const growth01 = clamp01(ageDays / 30);     // grows over 30 days
+
+      const seedStr = `forest|${FOREST_START.toISOString().slice(0,10)}|tree|${i}`;
+      const seed = xmur3(seedStr)();
+      const rand = mulberry32(seed);
+
+      const radius = 6 + Math.sqrt(i) * 3.0;
+      const theta = rand() * Math.PI * 2;
+      const jitter = (rand()-0.5) * 2.2;
+
+      const x = Math.cos(theta) * radius + jitter;
+      const z = Math.sin(theta) * radius + (rand()-0.5) * 2.2;
+
+      const tree = makeTree(seedStr, growth01);
+      tree.position.set(x, 0, z);
+      tree.rotation.y = rand() * Math.PI * 2;
+
+      forest.add(tree);
+    }
+
+    for (let i=0; i<treeCount; i++) placeTree(i);
+
+    // HUD
+    document.getElementById('stats').textContent =
+      `Today: ${now.toDateString()}  |  Start: ${FOREST_START.toDateString()}  |  Trees: ${treeCount}`;
+
+    // ---------- Render loop ----------
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
